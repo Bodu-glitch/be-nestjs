@@ -1,11 +1,10 @@
 import { Controller, Post, Get, Patch, Body, UseGuards } from '@nestjs/common';
 import { AuthService } from './auth.service.js';
 import { LoginDto } from './dto/login.dto.js';
-import { GoogleAuthDto } from './dto/google-auth.dto.js';
 import { ChangePasswordDto } from './dto/change-password.dto.js';
 import { ForgotPasswordDto, ResetPasswordDto, UpdateDeviceTokenDto } from './dto/reset-password.dto.js';
-import { SelectTenantDto } from './dto/select-tenant.dto.js';
 import { RegisterDto } from './dto/register.dto.js';
+import { CreateTenantDto } from './dto/create-tenant.dto.js';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard.js';
 import { CurrentUser } from '../common/decorators/current-user.decorator.js';
 
@@ -21,16 +20,6 @@ export class AuthController {
   @Post('login')
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto);
-  }
-
-  @Post('google')
-  loginWithGoogle(@Body() dto: GoogleAuthDto) {
-    return this.authService.loginWithGoogle(dto);
-  }
-
-  @Post('select-tenant')
-  selectTenant(@Body() dto: SelectTenantDto) {
-    return this.authService.selectTenant(dto);
   }
 
   @UseGuards(JwtAuthGuard)
@@ -59,6 +48,12 @@ export class AuthController {
   @Post('reset-password')
   resetPassword(@Body() dto: ResetPasswordDto) {
     return this.authService.resetPassword(dto);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('create-tenant')
+  createTenant(@CurrentUser() user: { id: string }, @Body() dto: CreateTenantDto) {
+    return this.authService.createTenant(user.id, dto);
   }
 
   @UseGuards(JwtAuthGuard)

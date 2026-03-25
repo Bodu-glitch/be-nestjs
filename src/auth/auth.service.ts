@@ -6,15 +6,12 @@ import {
   ForbiddenException,
   ConflictException,
 } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
 import { SupabaseService } from '../supabase/supabase.service.js';
 import { RedisService } from '../redis/redis.service.js';
 import { EmailService } from '../email/email.service.js';
 import { LoginDto } from './dto/login.dto.js';
-import { GoogleAuthDto } from './dto/google-auth.dto.js';
 import { ChangePasswordDto } from './dto/change-password.dto.js';
 import { ForgotPasswordDto, ResetPasswordDto } from './dto/reset-password.dto.js';
-import { SelectTenantDto } from './dto/select-tenant.dto.js';
 import { RegisterDto } from './dto/register.dto.js';
 
 function generateSlug(name: string): string {
@@ -27,13 +24,10 @@ function generateSlug(name: string): string {
     .substring(0, 50);
 }
 
-const AUTH_PENDING_TTL = 300; // 5 minutes
-
 @Injectable()
 export class AuthService {
   constructor(
     private supabase: SupabaseService,
-    private jwtService: JwtService,
     private redis: RedisService,
     private emailService: EmailService,
   ) {}
@@ -70,7 +64,6 @@ export class AuthService {
       .single();
 
     if (existingTenant) {
-      // Rollback user creation
       await this.supabase.db.auth.admin.deleteUser(authData.user.id);
       throw new ConflictException({ code: 'SLUG_ALREADY_EXISTS', message: 'Tenant slug already taken' });
     }
@@ -94,10 +87,19 @@ export class AuthService {
       role: 'business_owner',
     });
 
-    // 6. Issue JWT
-    const payload = { sub: authData.user.id, email: dto.email, role: 'business_owner', tenant_id: tenant.id };
+    // 6. Sign in to get Supabase session
+    const { data: sessionData, error: signInError } = await this.supabase.authClient.auth.signInWithPassword({
+      email: dto.email,
+      password: dto.password,
+    });
+
+    if (signInError || !sessionData.session) {
+      throw new BadRequestException('Registration succeeded but session creation failed');
+    }
+
     return {
-      access_token: this.jwtService.sign(payload),
+      access_token: sessionData.session.access_token,
+      refresh_token: sessionData.session.refresh_token,
       user: {
         id: authData.user.id,
         email: dto.email,
@@ -115,7 +117,7 @@ export class AuthService {
       password: dto.password,
     });
 
-    if (error || !data.user) {
+    if (error || !data.user || !data.session) {
       throw new UnauthorizedException({ code: 'INVALID_CREDENTIALS', message: 'Invalid email or password' });
     }
 
@@ -135,45 +137,15 @@ export class AuthService {
       .update({ last_login_at: new Date().toISOString() })
       .eq('id', user.id);
 
-    return this.issueTokenForUser(user);
-  }
+    const tokens = {
+      access_token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+    };
 
-  async loginWithGoogle(dto: GoogleAuthDto) {
-    const { data, error } = await this.supabase.authClient.auth.signInWithIdToken({
-      provider: 'google',
-      token: dto.id_token,
-      ...(dto.access_token ? { access_token: dto.access_token } : {}),
-    });
-
-    if (error || !data.user) {
-      throw new UnauthorizedException({ code: 'INVALID_CREDENTIALS', message: 'Google authentication failed' });
-    }
-
-    const { data: user, error: userError } = await this.supabase.db
-      .from('users')
-      .select('*')
-      .eq('id', data.user.id)
-      .eq('is_active', true)
-      .single();
-
-    if (userError || !user) {
-      throw new UnauthorizedException({ code: 'INVALID_CREDENTIALS', message: 'User account not found or inactive' });
-    }
-
-    await this.supabase.db
-      .from('users')
-      .update({ last_login_at: new Date().toISOString() })
-      .eq('id', user.id);
-
-    return this.issueTokenForUser(user);
-  }
-
-  private async issueTokenForUser(user: any) {
-    // Superadmin: issue JWT immediately (no tenant context)
+    // Superadmin: issue immediately
     if (user.role === 'superadmin') {
-      const payload = { sub: user.id, email: user.email, role: user.role, tenant_id: null };
       return {
-        access_token: this.jwtService.sign(payload),
+        ...tokens,
         user: {
           id: user.id,
           email: user.email,
@@ -211,59 +183,22 @@ export class AuthService {
       avatar_url: user.avatar_url,
     };
 
-    // Single tenant: auto-issue JWT
+    // Single tenant: return with tenant context
     if (memberships.length === 1) {
       const m = memberships[0] as any;
-      const payload = { sub: user.id, email: user.email, role: m.role, tenant_id: m.tenant_id };
       return {
-        access_token: this.jwtService.sign(payload),
+        ...tokens,
         user: { ...userInfo, role: m.role, tenant_id: m.tenant_id },
         tenants,
       };
     }
 
-    // Multiple tenants: store pending session, require selection
-    await this.redis.set(`auth_pending:${user.id}`, '1', AUTH_PENDING_TTL);
+    // Multiple tenants: client picks one (token already issued)
     return {
+      ...tokens,
       user: userInfo,
       tenants,
       requires_tenant_selection: true,
-    };
-  }
-
-  async selectTenant(dto: SelectTenantDto) {
-    const key = `auth_pending:${dto.user_id}`;
-    const pending = await this.redis.get(key);
-    if (!pending) {
-      throw new UnauthorizedException({ code: 'INVALID_SESSION', message: 'Session expired or invalid. Please login again.' });
-    }
-
-    const { data: membership } = await this.supabase.db
-      .from('user_tenants')
-      .select('role, tenants!inner(id, status)')
-      .eq('user_id', dto.user_id)
-      .eq('tenant_id', dto.tenant_id)
-      .eq('is_active', true)
-      .eq('tenants.status', 'active')
-      .single();
-
-    if (!membership) {
-      throw new ForbiddenException({ code: 'FORBIDDEN', message: 'Not a member of this tenant' });
-    }
-
-    await this.redis.delete(key);
-
-    const { data: user } = await this.supabase.db
-      .from('users')
-      .select('id, email, full_name, avatar_url')
-      .eq('id', dto.user_id)
-      .single();
-
-    const m = membership as any;
-    const payload = { sub: dto.user_id, email: user!.email, role: m.role, tenant_id: dto.tenant_id };
-    return {
-      access_token: this.jwtService.sign(payload),
-      user: { ...user, role: m.role, tenant_id: dto.tenant_id },
     };
   }
 
@@ -280,7 +215,6 @@ export class AuthService {
       throw new BadRequestException({ code: 'PASSWORD_MISMATCH', message: 'Mật khẩu nhập lại không khớp' });
     }
 
-    // Verify current password via Supabase Auth
     const { error } = await this.supabase.authClient.auth.signInWithPassword({
       email,
       password: dto.current_password,
@@ -290,7 +224,6 @@ export class AuthService {
       throw new BadRequestException({ code: 'INVALID_PASSWORD', message: 'Current password is incorrect' });
     }
 
-    // Update password via admin API
     const { error: updateError } = await this.supabase.db.auth.admin.updateUserById(userId, {
       password: dto.new_password,
     });
@@ -310,7 +243,6 @@ export class AuthService {
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await this.redis.setOtp(dto.email, otp);
-
     await this.emailService.sendOtpEmail(dto.email, otp);
 
     return { message: 'If that email exists, an OTP has been sent' };
@@ -347,26 +279,72 @@ export class AuthService {
   async getProfile(userId: string, tenantId: string | null) {
     const { data: user, error } = await this.supabase.db
       .from('users')
-      .select('id, email, full_name, role, phone, avatar_url, last_login_at, created_at')
+      .select('id, email, full_name, role, phone, avatar_url, last_login_at, created_at, is_active')
       .eq('id', userId)
       .single();
 
     if (error || !user) throw new NotFoundException({ code: 'USER_NOT_FOUND', message: 'User not found' });
 
-    if (tenantId) {
-      const { data: membership } = await this.supabase.db
-        .from('user_tenants')
-        .select('role, tenant_id')
-        .eq('user_id', userId)
-        .eq('tenant_id', tenantId)
-        .single();
-
-      if (membership) {
-        return { ...user, role: (membership as any).role, tenant_id: tenantId };
-      }
+    if (user.role === 'superadmin') {
+      return { ...user, tenant_id: null, tenants: [] };
     }
 
-    return { ...user, tenant_id: tenantId };
+    // Fetch all tenant memberships for this user
+    const { data: memberships } = await this.supabase.db
+      .from('user_tenants')
+      .select('role, tenant_id, tenants!inner(id, name, slug, status)')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .eq('tenants.status', 'active');
+
+    const tenants = (memberships ?? []).map((m: any) => ({
+      id: m.tenants.id,
+      name: m.tenants.name,
+      slug: m.tenants.slug,
+      role: m.role,
+    }));
+
+    if (tenantId) {
+      const membership = (memberships ?? []).find((m: any) => m.tenant_id === tenantId);
+      return {
+        ...user,
+        role: (membership as any)?.role ?? user.role,
+        tenant_id: tenantId,
+        tenants,
+      };
+    }
+
+    return { ...user, tenant_id: null, tenants };
+  }
+
+  async createTenant(userId: string, dto: { tenant_name: string; tenant_slug?: string }) {
+    const slug = dto.tenant_slug ?? generateSlug(dto.tenant_name);
+
+    const { data: existingTenant } = await this.supabase.db
+      .from('tenants')
+      .select('id')
+      .eq('slug', slug)
+      .single();
+
+    if (existingTenant) {
+      throw new ConflictException({ code: 'SLUG_ALREADY_EXISTS', message: 'Tenant slug already taken' });
+    }
+
+    const { data: tenant, error: tenantError } = await this.supabase.db
+      .from('tenants')
+      .insert({ name: dto.tenant_name, slug })
+      .select()
+      .single();
+
+    if (tenantError) throw new BadRequestException(tenantError.message);
+
+    await this.supabase.db.from('user_tenants').insert({
+      user_id: userId,
+      tenant_id: tenant.id,
+      role: 'business_owner',
+    });
+
+    return { tenant: { id: tenant.id, name: tenant.name, slug: tenant.slug } };
   }
 
   async updateDeviceToken(userId: string, deviceToken: string | null) {

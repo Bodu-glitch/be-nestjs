@@ -6,7 +6,6 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
-import { JwtService } from '@nestjs/jwt';
 import { SupabaseService } from '../supabase/supabase.service.js';
 import { EmailService } from '../email/email.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
@@ -18,7 +17,6 @@ import { PaginationDto } from '../common/dto/pagination.dto.js';
 export class StaffService {
   constructor(
     private supabase: SupabaseService,
-    private jwtService: JwtService,
     private emailService: EmailService,
     private notifications: NotificationsService,
   ) {}
@@ -180,15 +178,18 @@ export class StaffService {
       .update({ status: 'accepted' })
       .eq('id', invitation.id);
 
-    const payload = {
-      sub: authData.user.id,
-      email: authData.user.email,
-      role: invitation.role,
-      tenant_id: invitation.tenant_id,
-    };
+    const { data: sessionData, error: signInError } = await this.supabase.authClient.auth.signInWithPassword({
+      email: invitation.email,
+      password: dto.password,
+    });
+
+    if (signInError || !sessionData.session) {
+      throw new BadRequestException('Registration succeeded but session creation failed');
+    }
 
     return {
-      access_token: this.jwtService.sign(payload),
+      access_token: sessionData.session.access_token,
+      refresh_token: sessionData.session.refresh_token,
       user: {
         id: authData.user.id,
         email: authData.user.email,
